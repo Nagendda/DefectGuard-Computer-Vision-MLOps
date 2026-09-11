@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+"""
+Evaluate a YOLOv8 model and (optionally) enforce an evaluation gate.
+
+Why this exists:
+Training produces weights (best.pt). Before you "ship" a model, you want an
+objective check that it meets a minimum quality bar. In production MLOps, this
+step is often called a "gate".
+
+This script:
+- runs YOLOv8 validation (`YOLO(...).val(...)`)
+- extracts mAP@0.5 (map50) and other metrics if available
+- exits with a non-zero code if the gate is enabled and the threshold is not met
+
+Notes:
+- The gate threshold is `--min-map50` (default 0.85).
+- If metrics cannot be extracted (dataset not labeled / val fails), the script
+  exits non-zero when `--enforce-gate` is set.
+"""
+
+import argparse
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from ultralytics import YOLO
+
+
+@dataclass(frozen=True)
+class EvalMetrics:
+    # mAP@0.5: "How good is the detector when IoU threshold is 0.5?"
+    map50: float | None
+    # mAP@0.5:0.95: stricter aggregate metric across multiple IoU thresholds.
+    map50_95: float | None
+
+
+def _extract_metrics(result: Any) -> EvalMetrics:
+    """
+    Best-effort extraction of common YOLOv8 validation metrics.
+
+    Ultralytics has changed result object shapes across versions. This function
+    tries a few known locations for mAP metrics and returns None when not found.
+    """
+
+    # Default to None so callers can decide what to do if evaluation isn't available.
+    map50 = None
+    map50_95 = None
+
+    # Newer Ultralytics versions typically expose `results_dict`.
+    results_dict = getattr(result, "results_dict", None)
+    if isinstance(results_dict, dict):
+        # Try multiple key spellings to stay compatible across Ultralytics releases.
+        for key in ("metrics/mAP50(B)", "metrics/mAP50", "map50"):
+            v = results_dict.get(key)
+            if isinstance(v, (int, float)):
+                map50 = float(v)
+                break
+        for key in ("metrics/mAP50-95(B)", "metrics/mAP50-95", "map"):
+            v = results_dict.get(key)
+            if isinstance(v, (int, float)):
+                map50_95 = float(v)
+                break
+
+    # Some versions expose metrics under `box`.
+    box = getattr(result, "box", None)
+    if box is not None:
+        # Older versions expose metrics under `result.box`.
+        v = getattr(box, "map50", None)
+        if isinstance(v, (int, float)):
+            map50 = float(v)
+        v = getattr(box, "map", None)
+        if isinstance(v, (int, float)):
+            map50_95 = float(v)
+
+    return EvalMetrics(map50=map50, map50_95=map50_95)
+
+
+def main() -> None:
+    # Parse CLI arguments so this script can be used from terminal, CI, or Prefect.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights", required=True, help="Path to YOLOv8 weights (e.g. best.pt)")
+    parser.add_argument("--data", required=True, help="YOLO dataset YAML path")
+    parser.add_argument("--min-map50", type=float, default=0.85)
+    parser.add_argument("--enforce-gate", action="store_true")
+    args = parser.parse_args()
+
+    # Load weights and run validation against the dataset YAML's val split.
+    model = YOLO(args.weights)
+    result = model.val(data=args.data, verbose=False)
+
+    # Print metrics so this can be used in shells/CI logs.
+    metrics = _extract_metrics(result)
+    # asdict() turns the dataclass into a normal Python dict for pretty printing/logging.
+    print(asdict(metrics))
+
+    if args.enforce_gate:
+        # Gate behavior: fail the process (non-zero exit) when metric is missing or below threshold.
+        if metrics.map50 is None:
+            raise SystemExit("Gate enabled but map50 could not be extracted")
+        if metrics.map50 < args.min_map50:
+            raise SystemExit(f"Gate failed: map50 {metrics.map50:.4f} < {args.min_map50:.4f}")
+
+
+if __name__ == "__main__":
+    main()
